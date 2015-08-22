@@ -34,11 +34,13 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Set;
+import jenkins.tasks.SimpleBuildStep;
 
 /**
  * @author kyle.sweeney@valtech.com
  */
-public class MsBuildBuilder extends Builder {
+public class MsBuildBuilder extends Builder implements SimpleBuildStep {
+
     /**
      * GUI fields
      */
@@ -51,15 +53,18 @@ public class MsBuildBuilder extends Builder {
     private final boolean unstableIfWarnings;
 
     /**
-     * When this builder is created in the project configuration step,
-     * the builder object will be created from the strings below.
+     * When this builder is created in the project configuration step, the
+     * builder object will be created from the strings below.
      *
-     * @param msBuildName                The Visual Studio logical name
-     * @param msBuildFile                The name/location of the MSBuild file
-     * @param cmdLineArgs                Whitespace separated list of command line arguments
-     * @param buildVariablesAsProperties If true, pass build variables as properties to MSBuild
-     * @param continueOnBuildFailure     If true, job will continue dispite of MSBuild build failure
-     * @param unstableIfWarnings         If true, job will be unstable if there are warnings
+     * @param msBuildName The Visual Studio logical name
+     * @param msBuildFile The name/location of the MSBuild file
+     * @param cmdLineArgs Whitespace separated list of command line arguments
+     * @param buildVariablesAsProperties If true, pass build variables as
+     * properties to MSBuild
+     * @param continueOnBuildFailure If true, job will continue dispite of
+     * MSBuild build failure
+     * @param unstableIfWarnings If true, job will be unstable if there are
+     * warnings
      */
     @DataBoundConstructor
     @SuppressWarnings("unused")
@@ -105,8 +110,9 @@ public class MsBuildBuilder extends Builder {
     public MsBuildInstallation getMsBuild() {
         DescriptorImpl descriptor = (DescriptorImpl) getDescriptor();
         for (MsBuildInstallation i : descriptor.getInstallations()) {
-            if (msBuildName != null && i.getName().equals(msBuildName))
+            if (msBuildName != null && i.getName().equals(msBuildName)) {
                 return i;
+            }
         }
 
         return null;
@@ -151,13 +157,14 @@ public class MsBuildBuilder extends Builder {
         normalizedArgs = Util.replaceMacro(normalizedArgs, env);
         normalizedArgs = Util.replaceMacro(normalizedArgs, build.getBuildVariables());
 
-        if (normalizedArgs.trim().length() > 0)
+        if (normalizedArgs.trim().length() > 0) {
             args.add(tokenizeArgs(normalizedArgs));
+        }
 
         //Build /P:key1=value1;key2=value2 ...
         Map<String, String> propertiesVariables = getPropertiesVariables(build);
-        if (buildVariablesAsProperties && propertiesVariables.size() != 0) {
-            StringBuffer parameters = new StringBuffer();
+        if (buildVariablesAsProperties && !propertiesVariables.isEmpty()) {
+            StringBuilder parameters = new StringBuilder();
             parameters.append("/p:");
             for (Map.Entry<String, String> entry : propertiesVariables.entrySet()) {
                 parameters.append(entry.getKey()).append("=").append(entry.getValue()).append(";");
@@ -211,13 +218,12 @@ public class MsBuildBuilder extends Builder {
         }
     }
 
-
     private Map<String, String> getPropertiesVariables(AbstractBuild build) {
 
         Map<String, String> buildVariables = build.getBuildVariables();
 
         final Set<String> sensitiveBuildVariables = build.getSensitiveBuildVariables();
-        if (sensitiveBuildVariables == null || sensitiveBuildVariables.size() == 0) {
+        if (sensitiveBuildVariables == null || sensitiveBuildVariables.isEmpty()) {
             return buildVariables;
         }
 
@@ -227,7 +233,6 @@ public class MsBuildBuilder extends Builder {
 
         return buildVariables;
     }
-
 
     @Override
     public Descriptor<Builder> getDescriptor() {
@@ -248,27 +253,135 @@ public class MsBuildBuilder extends Builder {
 
         final String[] tokenize = Util.tokenize(args);
 
-        if (tokenize == null) {
-            return null;
-        }
-
-        if (args != null && args.endsWith("\\")) {
+        if (args.endsWith("\\")) {
             tokenize[tokenize.length - 1] = tokenize[tokenize.length - 1] + "\\";
         }
 
         return tokenize;
     }
 
+    @Override
+    public void perform(Run<?, ?> run, FilePath filePath, Launcher launcher, TaskListener taskListener) throws InterruptedException, IOException {
+
+        ArgumentListBuilder args = new ArgumentListBuilder();
+        String execName = "msbuild.exe";
+        MsBuildInstallation ai = getMsBuild();
+
+        if (ai == null) {
+            taskListener.getLogger().println("Path To MSBuild.exe: " + execName);
+            args.add(execName);
+        } else {
+            ai = ai.forNode(getNode(filePath), taskListener);
+            ai = ai.forEnvironment(run.getEnvironment(taskListener));
+            String pathToMsBuild = ai.getHome();
+            FilePath exec = new FilePath(launcher.getChannel(), pathToMsBuild);
+
+            try {
+                if (!exec.exists()) {
+                    taskListener.fatalError(pathToMsBuild + " doesn't exist");
+                    run.setResult(Result.FAILURE);
+                }
+            } catch (IOException e) {
+                taskListener.fatalError("Failed checking for existence of " + pathToMsBuild);
+                run.setResult(Result.FAILURE);
+            }
+
+            taskListener.getLogger().println("Path To MSBuild.exe: " + pathToMsBuild);
+            args.add(pathToMsBuild);
+
+            if (ai.getDefaultArgs() != null) {
+                args.add(tokenizeArgs(ai.getDefaultArgs()));
+            }
+        }
+
+        String normalizedArgs = cmdLineArgs.replaceAll("[\t\r\n]+", " ");
+        normalizedArgs = Util.replaceMacro(normalizedArgs, run.getEnvironment(taskListener));
+
+        if (normalizedArgs != null && normalizedArgs.trim().length() > 0) {
+            args.add(tokenizeArgs(normalizedArgs));
+        }
+
+        //Build /P:key1=value1;key2=value2 ...
+        Map<String, String> propertiesVariables = run.getCharacteristicEnvVars(); // getPropertiesVariables(run);
+        if (buildVariablesAsProperties && !propertiesVariables.isEmpty()) {
+            StringBuilder parameters = new StringBuilder();
+            parameters.append("/p:");
+            for (Map.Entry<String, String> entry : propertiesVariables.entrySet()) {
+                parameters.append(entry.getKey()).append("=").append(entry.getValue()).append(";");
+            }
+            parameters.delete(parameters.length() - 1, parameters.length());
+            args.add(parameters.toString());
+        }
+
+        //If a msbuild file is specified, then add it as an argument, otherwise
+        //msbuild will search for any file that ends in .proj or .sln
+        String normalizedFile = null;
+        if (msBuildFile != null && msBuildFile.trim().length() != 0) {
+            normalizedFile = msBuildFile.replaceAll("[\t\r\n]+", " ");
+            normalizedFile = Util.replaceMacro(normalizedFile, run.getEnvironment(taskListener));
+            //normalizedFile = Util.replaceMacro(normalizedFile, run.getBuildVariables());
+            if (normalizedFile.length() > 0) {
+                args.add(normalizedFile);
+            }
+        }
+
+        FilePath pwd = filePath;
+        if (normalizedFile != null) {
+            FilePath msBuildFilePath = pwd.child(normalizedFile);
+            if (!msBuildFilePath.exists()) {
+                throw new AbortException(String.format("Could not find project or solution to build at %s", normalizedFile));
+            }
+        }
+
+        if (!launcher.isUnix()) {
+            args.prepend("cmd.exe", "/C", "\"");
+            args.add("\"", "&&", "exit", "%%ERRORLEVEL%%");
+        }
+
+        try {
+            taskListener.getLogger().println(String.format("Executing the command %s from %s", args.toStringWithQuote(), pwd));
+            // Parser to find the number of Warnings/Errors
+            MsBuildConsoleParser mbcp = new MsBuildConsoleParser(taskListener.getLogger(), run.getCharset());
+            // Launch the msbuild.exe
+            int resultCode = launcher.launch().cmds(args).envs(run.getEnvironment(taskListener)).stdout(mbcp).pwd(pwd).join();
+            // Check the number of warnings
+            if (unstableIfWarnings && mbcp.getNumberOfWarnings() > 0) {
+                taskListener.getLogger().println("> Set build UNSTABLE because there are warnings.");
+                run.setResult(Result.UNSTABLE);
+            }
+
+            if (mbcp.getNumberOfErrors() > 0) {
+                run.setResult(continueOnBuildFailure ? Result.SUCCESS : Result.FAILURE);
+            } else {
+                run.setResult(Result.SUCCESS);
+            }
+
+        } catch (IOException e) {
+            Util.displayIOException(e, taskListener);
+            run.setResult(Result.FAILURE);
+        }
+    }
+
+    private static Node getNode(FilePath filePath) {
+        if (filePath != null && filePath.toComputer() != null){
+            return filePath.toComputer().getNode();
+        }
+        return null;
+    }
+
     @Extension
     public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
+
         @CopyOnWrite
-        private volatile MsBuildInstallation[] installations = new MsBuildInstallation[0];
+        private volatile MsBuildInstallation[] installations;
 
         public DescriptorImpl() {
             super(MsBuildBuilder.class);
+            this.installations = new MsBuildInstallation[0];
             load();
         }
 
+        @Override
         public String getDisplayName() {
             return Messages.MsBuildBuilder_DisplayName();
         }
